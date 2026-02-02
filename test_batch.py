@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Run a small batch of new_exp prompts and save results to output/batch_results.json.
+Run a small batch of new_exp prompts against Cloud Run endpoint.
 
 Run from repo root (agent_sdk_v2):
   python new_exp/test_batch.py
-  python new_exp/test_batch.py --limit 2
+  python new_exp/test_batch.py --limit 5          # first 5
+  python new_exp/test_batch.py --random 20        # random 20
+  python new_exp/test_batch.py -r 20 -i data/grade-5-ela-benchmark.json
 
-Uses SKILLS_ROOT=new_exp so the SDK loads .claude/skills/ from new_exp.
+Default endpoint: https://inceptagentic-skill-mcq-lanzf3jtla-uc.a.run.app
 """
 
 from __future__ import annotations
@@ -14,25 +16,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# Run from repo root: python new_exp/test_batch.py
+import httpx
+
+# Paths
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NEW_EXP = REPO_ROOT / "new_exp"
 OUTPUT_DIR = NEW_EXP / "output"
 OUTPUT_JSON = OUTPUT_DIR / "batch_results.json"
 
-sys.path.insert(0, str(REPO_ROOT / "src"))
-os.environ["SKILLS_ROOT"] = "new_exp"
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(REPO_ROOT / ".env", override=False)
-except ImportError:
-    pass
+# Default Cloud Run endpoint
+DEFAULT_ENDPOINT = "https://inceptagentic-skill-mcq-lanzf3jtla-uc.a.run.app"
 
 
 def load_prompts(path: Path) -> list[dict]:
@@ -66,24 +64,43 @@ def load_prompts(path: Path) -> list[dict]:
     raise ValueError(f"Unsupported JSON shape: need list or dict with 'prompts'/'requests' list")
 
 
-async def run_batch(prompts: list[dict], limit: int | None, verbose: bool, input_file: str = "") -> dict:
-    """Run generation for each prompt; return same shape as scripts/generate_batch.py."""
-    from agentic_pipeline_sdk import generate_one_agentic
-
-    if limit:
+async def run_batch(
+    prompts: list[dict],
+    limit: int | None,
+    random_sample: int | None,
+    endpoint: str,
+    verbose: bool,
+    input_file: str = "",
+) -> dict:
+    """Run generation for each prompt via Cloud Run endpoint."""
+    if random_sample:
+        prompts = random.sample(prompts, min(random_sample, len(prompts)))
+    elif limit:
         prompts = prompts[:limit]
 
     generated = []
     errors = []
-    for i, req in enumerate(prompts):
-        skills = req.get("skills", {})
-        standard_id = skills.get("substandard_id", "?")
-        qtype = req.get("type", "?")
-        print(f"[{i+1}/{len(prompts)}] {standard_id} ({qtype})")
-        try:
-            result = await generate_one_agentic(req, verbose=verbose)
-            if result.get("success"):
-                items = result.get("generatedContent", {}).get("generated_content", [])
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for i, req in enumerate(prompts):
+            skills = req.get("skills", {})
+            standard_id = skills.get("substandard_id", "?")
+            qtype = req.get("type", "?")
+            print(f"[{i+1}/{len(prompts)}] {standard_id} ({qtype})")
+
+            try:
+                resp = await client.post(f"{endpoint}/generate", json=req)
+                if verbose:
+                    print(f"  Status: {resp.status_code}")
+
+                if resp.status_code != 200:
+                    error_msg = resp.text[:200] if resp.text else f"HTTP {resp.status_code}"
+                    errors.append({"request": req, "error": error_msg})
+                    print(f"  FAIL: HTTP {resp.status_code}")
+                    continue
+
+                data = resp.json()
+                items = data.get("generated_content", [])
                 if items:
                     generated.append({
                         "id": items[0].get("id", ""),
@@ -94,19 +111,20 @@ async def run_batch(prompts: list[dict], limit: int | None, verbose: bool, input
                 else:
                     errors.append({"request": req, "error": "No content in response"})
                     print("  FAIL: no content")
-            else:
-                errors.append({"request": req, "error": result.get("error", "Unknown")})
-                print(f"  FAIL: {result.get('error', '')[:60]}")
-        except Exception as e:
-            errors.append({"request": req, "error": str(e)})
-            print(f"  ERROR: {e}")
+
+            except httpx.TimeoutException:
+                errors.append({"request": req, "error": "Request timeout"})
+                print("  ERROR: timeout")
+            except Exception as e:
+                errors.append({"request": req, "error": str(e)})
+                print(f"  ERROR: {e}")
 
     return {
         "generated_content": generated,
         "errors": errors,
         "metadata": {
             "source": "new_exp/test_batch.py",
-            "skills_root": "new_exp",
+            "endpoint": endpoint,
             "input_file": input_file,
             "total": len(prompts),
             "success": len(generated),
@@ -117,11 +135,13 @@ async def run_batch(prompts: list[dict], limit: int | None, verbose: bool, input
 
 
 def main():
-    default_input = NEW_EXP / "test_prompts.jsonl"
-    parser = argparse.ArgumentParser(description="Run new_exp batch and save to output/batch_results.json")
-    parser.add_argument("--input", "-i", type=Path, default=default_input, help="Input JSONL or JSON file (benchmark or prompts)")
-    parser.add_argument("--limit", "-n", type=int, default=None, help="Limit number of prompts (e.g. first 20)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose SDK logs")
+    default_input = REPO_ROOT / "data" / "grade-5-ela-benchmark.json"
+    parser = argparse.ArgumentParser(description="Run new_exp batch against Cloud Run endpoint")
+    parser.add_argument("--input", "-i", type=Path, default=default_input, help="Input JSONL or JSON file")
+    parser.add_argument("--limit", "-n", type=int, default=None, help="First N prompts")
+    parser.add_argument("--random", "-r", type=int, default=None, help="Random N prompts")
+    parser.add_argument("--endpoint", "-e", type=str, default=DEFAULT_ENDPOINT, help=f"Cloud Run endpoint (default: {DEFAULT_ENDPOINT})")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--output", "-o", type=Path, default=OUTPUT_JSON, help="Output JSON path")
     args = parser.parse_args()
 
@@ -139,18 +159,24 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(prompts)} prompts from {prompts_path}")
-    print(f"SKILLS_ROOT=new_exp -> skills from {NEW_EXP / '.claude' / 'skills'}")
+    sample_info = ""
+    if args.random:
+        sample_info = f" (random {args.random})"
+    elif args.limit:
+        sample_info = f" (first {args.limit})"
+
+    print(f"Loaded {len(prompts)} prompts from {prompts_path}{sample_info}")
+    print(f"Endpoint: {args.endpoint}")
     print()
 
-    data = asyncio.run(run_batch(prompts, args.limit, args.verbose, input_file=str(prompts_path)))
+    data = asyncio.run(run_batch(prompts, args.limit, args.random, args.endpoint, args.verbose, input_file=str(prompts_path)))
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = args.output if args.output.is_absolute() else OUTPUT_DIR / args.output.name
     out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"\nSaved to {out_path}")
     print(f"  Success: {data['metadata']['success']}/{data['metadata']['total']}")
-    print(f"  Next: python new_exp/eval.py -i new_exp/output/batch_results.json")
+    print(f"  Next: python new_exp/eval.py -i {out_path}")
 
 
 if __name__ == "__main__":

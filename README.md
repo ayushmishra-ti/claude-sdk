@@ -2,49 +2,30 @@
 
 ## Overview
 
-This folder contains an experimental **responsibility-based** skill architecture for ELA question generation. The goal is to reduce context window usage and instruction conflicts by splitting the monolithic skill into composable sub-skills.
+This folder contains a **responsibility-based** skill architecture for ELA question generation. The goal is to reduce context window usage and instruction conflicts by splitting the monolithic skill into composable sub-skills.
 
-## Why We Made This Decision
+## Architecture
 
-### Problem with Monolithic Skills
+We use **3 skills** and **4 reference files**:
 
-Our original `ela-question-generation/SKILL.md` contained all rules in one file:
-- Grammar rules (for L.* standards)
-- Passage rules (for RL./RI.* standards)
-- Fill-in constraints
-- Scenario rules (for W.* standards)
+### Skills
 
-**Issue:** Every question generation loaded ALL rules, even when only a subset applied. This caused:
-- Instruction conflicts (grammar rules bleeding into non-grammar questions)
-- Higher token usage
-- Harder debugging when scores dropped
+| Skill | When Loaded | Purpose |
+|-------|-------------|---------|
+| `ela-question-core` | Every request | Output formats, routing, RL/RI/W.* questions |
+| `ela-grammar-l-standards` | L.* standards only | Grammar constraints → reads `grammar-rules.md` |
+| `ela-fill-in-constraints` | Fill-in type only | Ambiguity prevention → reads `fill-in-examples.md` |
 
-### Research Backing
+### Reference Files
 
-Based on the paper "When Single-Agent with Skills Replace Multi-Agent Systems" (arxiv.org/abs/2601.04748):
-- Skill selection accuracy is optimal with **8-20 skills**
-- Beyond that threshold, semantic confusability causes sharp accuracy drops
-- Fine-grained, disjoint skills reduce ambiguity and improve evaluation alignment
+| File | Used by | Content |
+|------|---------|---------|
+| `curriculum.md` | ela-question-core | Standard scope, assessment boundaries, misconceptions |
+| `passage-reference.md` | ela-question-core | RL.*/RI.* passage generation + quality rules |
+| `grammar-rules.md` | ela-grammar-l-standards | Grammar definitions by grade (K-12) |
+| `fill-in-examples.md` | ela-fill-in-constraints | Fill-in patterns and examples |
 
-### How Claude SDK Works
-
-1. Claude sees all available skill **names and descriptions** (from YAML frontmatter)
-2. Claude decides which skills to invoke based on the prompt
-3. **Only invoked skills** are fully loaded into context
-4. Unused skills contribute only ~25 tokens (metadata only)
-
-This means splitting skills = real token savings + fewer instruction conflicts.
-
-## Architecture: Responsibility-Based vs Type-Based
-
-We chose **responsibility-based** splitting over type-based:
-
-| Approach | Structure | Trade-off |
-|----------|-----------|-----------|
-| **Type-based** | `ela-mcq/`, `ela-fill-in/`, `ela-msq/` | Simpler routing, but grammar rules duplicated in each |
-| **Responsibility-based** | `ela-question-core/`, `ela-grammar-l-standards/`, `ela-fill-in-constraints/` | Single source of truth, composable, no duplication |
-
-### When Each Skill Loads
+### Skill Loading by Request
 
 | Request | Skills Loaded |
 |---------|---------------|
@@ -53,122 +34,115 @@ We chose **responsibility-based** splitting over type-based:
 | Fill-in for L.5.1.B (Grammar) | `ela-question-core` + `ela-grammar-l-standards` + `ela-fill-in-constraints` |
 | MCQ for W.6.2.C (Writing) | `ela-question-core` only |
 
-**Key insight:** Non-L.* standards don't load grammar rules at all, reducing irrelevant constraints.
+**Key insight:** Non-L.* standards don't load grammar rules at all.
 
-## Folder Structure (SDK-aligned)
-
-Reference lives **inside** `.claude` so SKILL.md can reference it per the [Agent Skills SDK](https://docs.anthropic.com). No reference at project root.
+## Folder Structure
 
 ```
 new_exp/
 ├── .claude/
-│   ├── reference/                 # Reference files (SKILL.md points here)
-│   │   ├── README.md              # Index and usage
+│   ├── reference/
 │   │   ├── curriculum.md          # Standard scope, assessment boundaries
-│   │   ├── common-rules.md        # All question types
-│   │   ├── grammar-rules.md       # L.* only
-│   │   ├── passage-guidelines.md  # RL.*/RI.* passage generation
-│   │   ├── passage-rules.md       # RL.*/RI.* evaluation
-│   │   ├── fill-in-rules.md       # Fill-in only
-│   │   ├── fill-in-examples.md    # Fill-in patterns
-│   │   ├── mcq-msq-rules.md       # MCQ/MSQ
-│   │   └── README-1-common.md, README-2-type-specific.md, README-3-reference.md
+│   │   ├── passage-reference.md   # RL.*/RI.* generation + quality rules
+│   │   ├── grammar-rules.md       # L.* grammar definitions
+│   │   └── fill-in-examples.md    # Fill-in patterns
 │   └── skills/
-│       ├── ela-question-core/
-│       │   └── SKILL.md           # Core: schema, formats, routing, RL/RI/W.*
-│       ├── ela-grammar-l-standards/
-│       │   └── SKILL.md           # L.* only: grammar constraints, .claude/reference/grammar-rules.md
-│       └── ela-fill-in-constraints/
-│           └── SKILL.md           # Fill-in only: ambiguity prevention, .claude/reference/fill-in-examples.md
-├── HOW_SKILLS_WORK.md             # How SDK + routing + reference work (read this)
-├── test_prompts.json              # Sample prompts
-├── COMPARISON.md                  # How to test both setups
-└── reference/                     # DEPRECATED: use .claude/reference/ (kept for backward compatibility)
-```
-
-**See [HOW_SKILLS_WORK.md](HOW_SKILLS_WORK.md)** for step-by-step flow, routing, and SDK checklist.
-
-## Workflow
-
-```
-User Prompt: "Generate MCQ for CCSS.ELA-LITERACY.RL.6.4"
-                            │
-                            ▼
-              ┌─────────────────────────┐
-              │  Claude sees all skills │
-              │  (names + descriptions) │
-              └─────────────────────────┘
-                            │
-                            ▼
-              ┌─────────────────────────┐
-              │  Claude decides:        │
-              │  "This is RL.* standard │
-              │   → need core only"     │
-              └─────────────────────────┘
-                            │
-                            ▼
-              ┌─────────────────────────┐
-              │  Only ela-question-core │
-              │  SKILL.md is loaded     │
-              └─────────────────────────┘
-                            │
-                            ▼
-              ┌─────────────────────────┐
-              │  Question generated     │
-              │  without grammar rules  │
-              │  polluting context      │
-              └─────────────────────────┘
-```
-
-## Expected Improvements
-
-1. **Reduced instruction conflicts** - Grammar rules won't leak into non-grammar questions
-2. **Lower token usage** - Only relevant skills loaded per request
-3. **Better debuggability** - Easy to trace which skill caused an issue
-4. **Improved evaluation scores** - Tighter guardrails, less ambiguity
-
-## Limitations
-
-- If benchmark is heavily L.* standards, type-based might be simpler
-- More skills invoked for L.* fill-in questions (3 skills vs 1)
-- Skill descriptions must be clearly distinct to avoid selection errors
-
-## Deployment (Cloud Run)
-
-Deploy **new_exp** to the MCQ skill service (same API as parent, uses `new_exp/.claude/skills/`):
-
-**Target:** `https://inceptagentic-skill-mcq-413562643011.us-central1.run.app/generate`
-
-From repo root (**agent_sdk_v2**):
-
-```bash
-bash new_exp/deploy.sh
-```
-
-- Build uses `Dockerfile.new_exp` and `cloudbuild-new_exp.yaml` (repo root).
-- Image bundles parent `src/` and **new_exp** `.claude/` (ela-question-core, ela-grammar-l-standards, ela-fill-in-constraints).
-- Requires `gcloud` and project `413562643011`; secret `ANTHROPIC_API_KEY` must exist in Secret Manager.
-
-## Running with the SDK
-
-When using the SDK with this experiment, set **`cwd`** to **`new_exp`** (or the repo root that contains `new_exp`) so the SDK discovers `.claude/skills/` and skills can Read `.claude/reference/` correctly.
-
-```python
-options = ClaudeAgentOptions(
-    cwd="/path/to/new_exp",  # or path/to/agent_sdk_v2 with skills under new_exp/.claude/
-    setting_sources=["user", "project"],
-    allowed_tools=["Skill", "Read", ...]
-)
+│       ├── ela-question-core/SKILL.md
+│       ├── ela-grammar-l-standards/SKILL.md
+│       └── ela-fill-in-constraints/SKILL.md
+├── output/                        # Generated results
+├── deploy.sh                      # Deploy to Cloud Run
+├── test_batch.py                  # Run batch against endpoint
+├── eval.py                        # Evaluate results
+└── README.md
 ```
 
 ## Testing
 
-- **test_prompts.json** — Sample requests (MCQ L.*, Fill-in L.*, MCQ RL.*) to run against both monolithic and new_exp.
-- **COMPARISON.md** — How to run both setups, compare InceptBench scores, and decide which is better for your use case.
+### Run batch against Cloud Run endpoint
 
-## Next Steps
+```bash
+# Random 20 prompts (default: data/grade-5-ela-benchmark.json)
+python new_exp/test_batch.py -r 20
 
-1. Test on sample prompts to verify correct skill selection
-2. Compare evaluation scores against monolithic approach (see COMPARISON.md)
-3. Measure actual token usage difference
-4. Iterate on skill descriptions if selection accuracy is low
+# First 10 prompts
+python new_exp/test_batch.py -n 10
+
+# Different benchmark
+python new_exp/test_batch.py -i data/grade-8-ela-benchmark.jsonl -r 20
+
+# Custom endpoint
+python new_exp/test_batch.py -r 20 --endpoint https://other-url.run.app
+```
+
+**Default endpoint:** `https://inceptagentic-skill-mcq-lanzf3jtla-uc.a.run.app`  
+**Default input:** `data/grade-5-ela-benchmark.json`
+
+**Flags:**
+- `-i` / `--input` — Input JSONL or JSON file
+- `-r` / `--random` — Random N prompts
+- `-n` / `--limit` — First N prompts
+- `-e` / `--endpoint` — Cloud Run endpoint
+- `-o` / `--output` — Output path (default: `output/batch_results.json`)
+
+### Evaluate results
+
+```bash
+python new_exp/eval.py -i new_exp/output/batch_results.json -o new_exp/output
+```
+
+## Deployment (Cloud Run)
+
+Deploy **new_exp** skills to Cloud Run:
+
+**Target:** `https://inceptagentic-skill-mcq-lanzf3jtla-uc.a.run.app`
+
+From repo root (**agent_sdk_v2**):
+
+```bash
+# Authenticate if needed
+gcloud auth login
+gcloud config set project eternal-aspect-485115-e3
+
+# Deploy
+bash new_exp/deploy.sh
+```
+
+**What it does:**
+- Builds with `Dockerfile.new_exp` (bundles `src/` + `new_exp/.claude/`)
+- Deploys to Cloud Run service `inceptagentic-skill-mcq`
+- Requires `ANTHROPIC_API_KEY` secret in Secret Manager
+
+## Why This Architecture
+
+### Problem with Monolithic Skills
+
+The original `ela-question-generation/SKILL.md` contained all rules in one file:
+- Grammar rules (L.*)
+- Passage rules (RL./RI.*)
+- Fill-in constraints
+- Scenario rules (W.*)
+
+**Issue:** Every request loaded ALL rules, causing instruction conflicts and higher token usage.
+
+### How Claude SDK Works
+
+1. Claude sees all skill **names and descriptions** (YAML frontmatter)
+2. Claude decides which skills to invoke based on the prompt
+3. **Only invoked skills** are fully loaded into context
+4. Unused skills contribute only ~25 tokens (metadata only)
+
+Splitting skills = real token savings + fewer instruction conflicts.
+
+### Research Backing
+
+Based on "When Single-Agent with Skills Replace Multi-Agent Systems" (arxiv.org/abs/2601.04748):
+- Skill selection accuracy is optimal with **8-20 skills**
+- Fine-grained, disjoint skills reduce ambiguity
+
+## Expected Improvements
+
+1. **Reduced instruction conflicts** — Grammar rules won't leak into non-grammar questions
+2. **Lower token usage** — Only relevant skills loaded per request
+3. **Better debuggability** — Easy to trace which skill caused an issue
+4. **Improved evaluation scores** — Tighter guardrails, less ambiguity
